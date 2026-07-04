@@ -1,0 +1,8 @@
+# Force a textual diff for TypeScript sources. Historically tree.ts embedded
+# control-char separators in its path-key tokens (a U+0000 null sentinel and a
+# U+0001 key separator); they are now written as JS unicode escapes so the
+# source is plain text. The `diff` attribute also keeps the *transition* diff
+# reviewable: the pre-image blob still contains the raw U+0000, which would
+# otherwise make Git render this very change as "Binary file". No eol/text
+# normalization is applied.
+*.ts diff
