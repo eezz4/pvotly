@@ -16,6 +16,27 @@ import type {
 export interface Aggregator {
   push(value: DataValue, record: DataRecord): void;
   value(): number | DataValue;
+  /**
+   * Merge another aggregator's accumulated state into this one. Used during
+   * bottom-up tree propagation to compute subtotals from leaf cells without
+   * re-scanning raw records.
+   *
+   * The `this` parameter type means each implementation receives its own
+   * concrete type, so it can read the other's private fields directly with no
+   * cast or `instanceof`. Callers only ever merge aggregators built for the same
+   * aggregation key (see `propagateAxis`), so the same-type invariant holds.
+   */
+  merge(other: this): void;
+}
+
+/**
+ * Append every element of `src` to `dst` in place. Uses a loop, not
+ * `dst.push(...src)`, because spreading a large array as call arguments overflows
+ * the call stack (hit when merging multi-million-element median/variance buffers,
+ * e.g. a grand-total subtotal or a parallel-reduce partial).
+ */
+function appendAll<T>(dst: T[], src: readonly T[]): void {
+  for (let i = 0; i < src.length; i++) dst.push(src[i]!);
 }
 
 function asNumber(value: DataValue): number | null {
@@ -39,6 +60,10 @@ class SumAggregator implements Aggregator {
   value(): number | null {
     return this.has ? this.sum : null;
   }
+  merge(other: this): void {
+    this.sum += other.sum;
+    this.has ||= other.has;
+  }
 }
 
 class CountAggregator implements Aggregator {
@@ -49,6 +74,9 @@ class CountAggregator implements Aggregator {
   value(): number {
     return this.n;
   }
+  merge(other: this): void {
+    this.n += other.n;
+  }
 }
 
 class DistinctCountAggregator implements Aggregator {
@@ -58,6 +86,9 @@ class DistinctCountAggregator implements Aggregator {
   }
   value(): number {
     return this.set.size;
+  }
+  merge(other: this): void {
+    other.set.forEach((v) => this.set.add(v));
   }
 }
 
@@ -74,6 +105,10 @@ class AverageAggregator implements Aggregator {
   value(): number | null {
     return this.n ? this.sum / this.n : null;
   }
+  merge(other: this): void {
+    this.sum += other.sum;
+    this.n += other.n;
+  }
 }
 
 class MinAggregator implements Aggregator {
@@ -85,6 +120,9 @@ class MinAggregator implements Aggregator {
   value(): number | null {
     return this.min;
   }
+  merge(other: this): void {
+    if (other.min !== null) this.min = this.min === null ? other.min : Math.min(this.min, other.min);
+  }
 }
 
 class MaxAggregator implements Aggregator {
@@ -95,6 +133,9 @@ class MaxAggregator implements Aggregator {
   }
   value(): number | null {
     return this.max;
+  }
+  merge(other: this): void {
+    if (other.max !== null) this.max = this.max === null ? other.max : Math.max(this.max, other.max);
   }
 }
 
@@ -111,6 +152,12 @@ class ProductAggregator implements Aggregator {
   value(): number | null {
     return this.has ? this.product : null;
   }
+  merge(other: this): void {
+    if (other.has) {
+      this.product *= other.product;
+      this.has = true;
+    }
+  }
 }
 
 class MedianAggregator implements Aggregator {
@@ -124,6 +171,9 @@ class MedianAggregator implements Aggregator {
     const sorted = [...this.values].sort((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
     return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+  }
+  merge(other: this): void {
+    appendAll(this.values, other.values);
   }
 }
 
@@ -147,6 +197,9 @@ class VarianceAggregator implements Aggregator {
     const variance = ss / (sample ? n - 1 : n);
     return this.mode === 'stdev' || this.mode === 'stdevp' ? Math.sqrt(variance) : variance;
   }
+  merge(other: this): void {
+    appendAll(this.values, other.values);
+  }
 }
 
 class FirstAggregator implements Aggregator {
@@ -161,6 +214,12 @@ class FirstAggregator implements Aggregator {
   value(): DataValue {
     return this.first;
   }
+  merge(other: this): void {
+    if (!this.set && other.set) {
+      this.first = other.first;
+      this.set = true;
+    }
+  }
 }
 
 class LastAggregator implements Aggregator {
@@ -170,6 +229,9 @@ class LastAggregator implements Aggregator {
   }
   value(): DataValue {
     return this.last;
+  }
+  merge(other: this): void {
+    if (other.last !== null) this.last = other.last;
   }
 }
 
@@ -223,27 +285,50 @@ export function resolveAggregator(
   return registry?.get(name) ?? globalRegistry.get(name);
 }
 
+/**
+ * Buffered values/records for custom aggregators, kept off the public object so
+ * `merge()` can replay them without exposing internal state on the Aggregator.
+ */
+const customBuffers = new WeakMap<Aggregator, { values: DataValue[]; records: DataRecord[] }>();
+
 /** Adapt an {@link AggregatorDefinition} (streaming or batch) to an {@link Aggregator}. */
 export function createCustomAggregator(definition: AggregatorDefinition): Aggregator {
+  const values: DataValue[] = [];
+  const records: DataRecord[] = [];
+
   // Streaming form takes priority when a reducer is provided.
   if (typeof definition.reduce === 'function') {
     const reduce = definition.reduce;
     const finalize = definition.finalize;
     let acc: unknown = definition.init ? definition.init() : undefined;
-    return {
+    const agg: Aggregator = {
       push(value, record) {
         acc = reduce(acc, value, record);
+        values.push(value);
+        records.push(record);
       },
       value() {
         return finalize ? finalize(acc) : (acc as number | DataValue);
       },
+      // Replay the other aggregator's buffered input through our reducer so the
+      // streaming accumulator stays correct after a merge.
+      merge(other) {
+        const buf = customBuffers.get(other);
+        if (!buf) return;
+        for (let i = 0; i < buf.values.length; i++) {
+          acc = reduce(acc, buf.values[i]!, buf.records[i]!);
+          values.push(buf.values[i]!);
+          records.push(buf.records[i]!);
+        }
+      },
     };
+    customBuffers.set(agg, { values, records });
+    return agg;
   }
+
   // Batch form: collect values/records, evaluate once.
   const evaluate = definition.evaluate;
-  const values: DataValue[] = [];
-  const records: DataRecord[] = [];
-  return {
+  const agg: Aggregator = {
     push(value, record) {
       values.push(value);
       records.push(record);
@@ -251,7 +336,15 @@ export function createCustomAggregator(definition: AggregatorDefinition): Aggreg
     value() {
       return evaluate ? evaluate(values, records) : null;
     },
+    merge(other) {
+      const buf = customBuffers.get(other);
+      if (!buf) return;
+      appendAll(values, buf.values);
+      appendAll(records, buf.records);
+    },
   };
+  customBuffers.set(agg, { values, records });
+  return agg;
 }
 
 /**

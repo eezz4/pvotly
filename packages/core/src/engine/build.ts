@@ -26,7 +26,7 @@ import {
   computeLeafCount,
   flatten,
   pathKey,
-  prefixTokenKeys,
+  tokenKey,
 } from './tree';
 
 interface EffectiveMeasure {
@@ -37,6 +37,12 @@ interface EffectiveMeasure {
   format?: NumberFormat;
   compiled?: CompiledFormula;
   raw: MeasureConfig;
+}
+
+/** A single base aggregation the grid must accumulate: an aggregation over one field (or null for count). */
+interface BaseAgg {
+  aggregation: AggregationName;
+  field: string | null;
 }
 
 interface AxisEntry {
@@ -95,6 +101,9 @@ function aggKeyOf(aggregation: AggregationName, field: string | null): string {
   return `${aggregation}::${field ?? ''}`;
 }
 
+/** Leaf/grand-total accumulation buckets: rowKey -> colKey -> aggKey -> Aggregator. */
+type CellMap = Map<string, Map<string, Map<string, Aggregator>>>;
+
 /** Build the fully computed pivot grid for a dataset + configuration. */
 export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGrid {
   const slice = config.slice ?? {};
@@ -139,34 +148,14 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
   }
 
   /* ---- 2. base aggregation plan -------------------------------------- */
-  const baseAggs = new Map<string, { aggregation: AggregationName; field: string | null }>();
-  const addAgg = (aggregation: AggregationName, field: string | null) => {
-    baseAggs.set(aggKeyOf(aggregation, field), { aggregation, field });
-  };
-  for (const m of measures) {
-    if (m.compiled) {
-      for (const ref of m.compiled.references) addAgg(ref.aggregation, ref.field);
-    } else {
-      addAgg(m.aggregation, m.uniqueName);
-    }
-  }
-  const collectFieldFilterAggs = (fields: SliceField[]) => {
-    for (const f of fields) {
-      if (f.filter?.type === 'value') {
-        addAgg(f.filter.aggregation ?? measureAggregation(measures, f.filter.measure), f.filter.measure);
-      }
-    }
-  };
-  collectFieldFilterAggs(rowSlice);
-  collectFieldFilterAggs(colSlice);
-  if (slice.sorting?.row) {
-    addAgg(measureAggregation(measures, slice.sorting.row.measure), slice.sorting.row.measure);
-  }
-  if (slice.sorting?.column) {
-    addAgg(measureAggregation(measures, slice.sorting.column.measure), slice.sorting.column.measure);
-  }
+  const baseAggs = buildBaseAggPlan(measures, rowSlice, colSlice, slice);
 
-  /* ---- 3. accumulate cross-tab buckets over every prefix ------------- */
+  /* ---- 3. accumulate buckets at leaf intersections + grand totals ----
+   *
+   * Only write to the leaf intersection and the two grand-total edges (at most
+   * 4 buckets per record) instead of every prefix combination. Intermediate
+   * subtotals are filled in bottom-up after the trees are built (propagateAxis).
+   */
   // Pivot-cache columns (resolved values + interned token codes), computed once
   // on the Dataset and reused across builds — reconfiguration no longer re-scans
   // or re-tokenizes the source records.
@@ -179,16 +168,17 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     if (field && !aggValueCols.has(field)) aggValueCols.set(field, dataset.resolvedColumn(field));
   }
 
-  const cells = new Map<string, Map<string, Map<string, Aggregator>>>();
   const makeBucket = (): Map<string, Aggregator> => {
     const m = new Map<string, Aggregator>();
     for (const [key, { aggregation }] of baseAggs) m.set(key, createAggregator(aggregation, customRegistry));
     return m;
   };
+  const cells: CellMap = new Map();
   for (const i of keep) {
     const record = allRecords[i]!;
-    const rKeys = prefixTokenKeys(rowTokenCols.map((c) => c[i]!));
-    const cKeys = prefixTokenKeys(colTokenCols.map((c) => c[i]!));
+    // Leaf key (cached token codes joined) + the empty grand-total key.
+    const rKeys = rowFields.length ? [tokenKey(rowTokenCols.map((c) => c[i]!)), ''] : [''];
+    const cKeys = colFields.length ? [tokenKey(colTokenCols.map((c) => c[i]!)), ''] : [''];
     for (const rk of rKeys) {
       let rowMap = cells.get(rk);
       if (!rowMap) {
@@ -208,6 +198,17 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     }
   }
 
+  /* ---- 4. build member trees + choose a subtotal strategy ------------ */
+  const rowRoots = buildMemberTreeFromColumns(keep, rowFields, rowTokenCols, rowValueCols, dataset);
+  const colRoots = buildMemberTreeFromColumns(keep, colFields, colTokenCols, colValueCols, dataset);
+
+  // Fill subtotal buckets bottom-up before ordering (cols first so their keys
+  // exist when rows propagate across every column key).
+  propagateAxis(cells, colRoots, [...cells.keys()], makeBucket, baseAggs, false);
+  const allColKeys = [...new Set([...cells.values()].flatMap((m) => [...m.keys()]))];
+  propagateAxis(cells, rowRoots, allColKeys, makeBucket, baseAggs, true);
+
+  /* ---- 5. aggregate access ------------------------------------------- */
   const rawAggAt = (rowKey: string, colKey: string, aggregation: AggregationName, field: string | null) => {
     const agg = cells.get(rowKey)?.get(colKey)?.get(aggKeyOf(aggregation, field));
     return agg ? agg.value() : null;
@@ -228,15 +229,13 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     return numericAggAt(rowKey, colKey, m.aggregation, m.uniqueName);
   };
 
-  /* ---- 4. build + order member trees --------------------------------- */
-  const rowRoots = buildMemberTreeFromColumns(keep, rowFields, rowTokenCols, rowValueCols, dataset);
-  const colRoots = buildMemberTreeFromColumns(keep, colFields, colTokenCols, colValueCols, dataset);
+  /* ---- 6. order member trees ------------------------------------------ */
   orderAxis(interner, rowRoots, rowSlice, 'row', measures, slice, numericAggAt);
   orderAxis(interner, colRoots, colSlice, 'column', measures, slice, numericAggAt);
   rowRoots.forEach(computeLeafCount);
   colRoots.forEach(computeLeafCount);
 
-  /* ---- 5. expansion + flatten ---------------------------------------- */
+  /* ---- 7. expansion + flatten ---------------------------------------- */
   const expandedSet = pathSet(interner, slice.expands?.rows, slice.expands?.columns);
   const collapsedSet = pathSet(interner, slice.drills?.rows, slice.drills?.columns);
   const defaultExpanded =
@@ -265,7 +264,7 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
   if (rowsGT && rowFields.length) rowEntries.push(grandTotalEntry(config));
   if (colsGT && colFields.length) colEntries.push(grandTotalEntry(config));
 
-  /* ---- 6. body, show-as, formatting, conditions ---------------------- */
+  /* ---- 8. body, show-as, formatting, conditions ---------------------- */
   const conditions = config.conditions;
   const cellIndex = new Map<string, PivotCell>();
   const body: PivotCell[][] = [];
@@ -295,6 +294,7 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     return cell;
   };
 
+  // Materialize the full body + cell index, then run the show-as and formatting passes.
   if (valuesAxis === 'rows' && measures.length) {
     // Measures laid out along the row axis: each row leaf expands into one body
     // row per measure; every body row has exactly one cell per column leaf.
@@ -315,13 +315,7 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     }
   }
 
-  applyShowAs(
-    rowEntries,
-    colEntries,
-    measures,
-    cellIndex,
-    measureNumeric,
-  );
+  applyShowAs(rowEntries, colEntries, measures, cellIndex, measureNumeric);
 
   // Format + conditional styling pass.
   for (const cell of cellIndex.values()) {
@@ -336,7 +330,7 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     );
   }
 
-  /* ---- 7. assemble public grid --------------------------------------- */
+  /* ---- 9. assemble public grid --------------------------------------- */
   const rowTree = rowRoots.map((n) => toHeaderNode(n, isExpanded));
   const columnTree = colRoots.map((n) => toHeaderNode(n, isExpanded));
   const rowLeaves = rowEntries.map((e) => entryToHeaderNode(e));
@@ -384,6 +378,93 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
 /* -------------------------------------------------------------------------- */
 /* helpers                                                                    */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Bottom-up propagation: for every non-leaf node in `roots`, create a cells
+ * Map entry by merging its children's aggregators.
+ *
+ * @param isRowAxis  true  → node.key is the row key, fixedKey is a col key.
+ *                   false → node.key is the col key, fixedKey is a row key.
+ *
+ * Uses node.children (all members) rather than orderedChildren so subtotals
+ * always reflect the full member set, matching the prefixKeys behaviour.
+ */
+function propagateAxis(
+  cells: Map<string, Map<string, Map<string, Aggregator>>>,
+  roots: MemberNode[],
+  fixedKeys: string[],
+  makeBucket: () => Map<string, Aggregator>,
+  baseAggs: Map<string, { aggregation: AggregationName; field: string | null }>,
+  isRowAxis: boolean,
+): void {
+  function walkPostOrder(node: MemberNode): void {
+    for (const child of node.children.values()) walkPostOrder(child);
+    if (!node.children.size) return; // leaf — already accumulated directly
+
+    for (const fixedKey of fixedKeys) {
+      const nodeRKey = isRowAxis ? node.key : fixedKey;
+      const nodeCKey = isRowAxis ? fixedKey : node.key;
+
+      let rowMap = cells.get(nodeRKey);
+      if (!rowMap) { rowMap = new Map(); cells.set(nodeRKey, rowMap); }
+      const parentBucket = makeBucket();
+      rowMap.set(nodeCKey, parentBucket);
+
+      for (const child of node.children.values()) {
+        const childRKey = isRowAxis ? child.key : fixedKey;
+        const childCKey = isRowAxis ? fixedKey : child.key;
+        const childBucket = cells.get(childRKey)?.get(childCKey);
+        if (!childBucket) continue;
+        for (const [aggKey] of baseAggs) {
+          parentBucket.get(aggKey)!.merge(childBucket.get(aggKey)!);
+        }
+      }
+    }
+  }
+
+  for (const root of roots) walkPostOrder(root);
+}
+
+/**
+ * The set of base aggregations the grid must accumulate at each cell: every
+ * measure (or its formula references), plus aggregations needed by value filters
+ * and value sorts. Shared by `buildGrid` and the parallel-reduce path so both
+ * accumulate exactly the same buckets.
+ */
+function buildBaseAggPlan(
+  measures: EffectiveMeasure[],
+  rowSlice: SliceField[],
+  colSlice: SliceField[],
+  slice: PivotConfiguration['slice'] & object,
+): Map<string, BaseAgg> {
+  const baseAggs = new Map<string, BaseAgg>();
+  const addAgg = (aggregation: AggregationName, field: string | null) => {
+    baseAggs.set(aggKeyOf(aggregation, field), { aggregation, field });
+  };
+  for (const m of measures) {
+    if (m.compiled) {
+      for (const ref of m.compiled.references) addAgg(ref.aggregation, ref.field);
+    } else {
+      addAgg(m.aggregation, m.uniqueName);
+    }
+  }
+  const collectFieldFilterAggs = (fields: SliceField[]) => {
+    for (const f of fields) {
+      if (f.filter?.type === 'value') {
+        addAgg(f.filter.aggregation ?? measureAggregation(measures, f.filter.measure), f.filter.measure);
+      }
+    }
+  };
+  collectFieldFilterAggs(rowSlice);
+  collectFieldFilterAggs(colSlice);
+  if (slice.sorting?.row) {
+    addAgg(measureAggregation(measures, slice.sorting.row.measure), slice.sorting.row.measure);
+  }
+  if (slice.sorting?.column) {
+    addAgg(measureAggregation(measures, slice.sorting.column.measure), slice.sorting.column.measure);
+  }
+  return baseAggs;
+}
 
 function resolveMeasures(
   configs: MeasureConfig[],
