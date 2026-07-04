@@ -126,6 +126,11 @@ export function buildMemberTree(
   return [...roots.values()];
 }
 
+/** Full path key from precomputed member-token codes (the leaf/grand key). */
+export function tokenKey(tokens: string[]): string {
+  return tokens.join(SEP);
+}
+
 /** Cumulative prefix keys built directly from precomputed member-token codes. */
 export function prefixTokenKeys(tokens: string[]): string[] {
   const keys: string[] = [''];
