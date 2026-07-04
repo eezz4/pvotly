@@ -36,16 +36,53 @@ export function valueToken(value: DataValue): string {
 
 const SEP = '\u0001';
 
-export function pathKey(segments: PathSeg[]): string {
-  return segments.map((s) => valueToken(s.value)).join(SEP);
+/**
+ * Member-token interner — the pivot-cache "shared items" dictionary. Each distinct
+ * {@link valueToken} string is assigned a compact base-36 code the first time it is
+ * seen; path keys are built from the short codes instead of repeating the often-long
+ * token strings across every cell key.
+ *
+ * Scoped to a {@link Dataset} (one interner per dataset, see `Dataset.interner`), so
+ * the dictionary is released together with the dataset — there is no process-global
+ * cache to grow unbounded across data refreshes, nor to desync against a dataset's
+ * cached token columns. A fresh dataset gets a fresh dictionary.
+ */
+export class Interner {
+  private readonly map = new Map<string, number>();
+  private next = 0;
+
+  /** Compact code for a raw token string (assigned on first sight, then reused). */
+  code(token: string): string {
+    let code = this.map.get(token);
+    if (code === undefined) {
+      code = this.next++;
+      this.map.set(token, code);
+    }
+    return code.toString(36);
+  }
+
+  /** Compact code for a member value (interns its {@link valueToken}). */
+  token(value: DataValue): string {
+    return this.code(valueToken(value));
+  }
+}
+
+export function pathKey(interner: Interner, segments: PathSeg[]): string {
+  let key = '';
+  for (let i = 0; i < segments.length; i++) {
+    const code = interner.token(segments[i]!.value);
+    key = i === 0 ? code : `${key}${SEP}${code}`;
+  }
+  return key;
 }
 
 /** All cumulative prefix keys of a value list, including the empty (grand total). */
-export function prefixKeys(values: DataValue[]): string[] {
+export function prefixKeys(interner: Interner, values: DataValue[]): string[] {
   const keys: string[] = [''];
   let acc = '';
   for (let i = 0; i < values.length; i++) {
-    acc = i === 0 ? valueToken(values[i]!) : `${acc}${SEP}${valueToken(values[i]!)}`;
+    const code = interner.token(values[i]!);
+    acc = i === 0 ? code : `${acc}${SEP}${code}`;
     keys.push(acc);
   }
   return keys;
@@ -76,7 +113,65 @@ export function buildMemberTree(
           caption: dataset.memberCaption(uniqueName, value),
           level,
           path: path.map((p) => ({ ...p })),
-          key: pathKey(path),
+          key: pathKey(dataset.interner, path),
+          children: new Map(),
+          orderedChildren: [],
+          leafCount: 0,
+        };
+        parent.set(token, node);
+      }
+      parent = node.children;
+    }
+  }
+  return [...roots.values()];
+}
+
+/** Cumulative prefix keys built directly from precomputed member-token codes. */
+export function prefixTokenKeys(tokens: string[]): string[] {
+  const keys: string[] = [''];
+  let acc = '';
+  for (let i = 0; i < tokens.length; i++) {
+    acc = i === 0 ? tokens[i]! : `${acc}\u0001${tokens[i]!}`;
+    keys.push(acc);
+  }
+  return keys;
+}
+
+/**
+ * Build the member hierarchy from precomputed token + value columns (the pivot
+ * cache's encoded records), addressed by record index. Equivalent to
+ * {@link buildMemberTree} but reads cached columns instead of re-resolving and
+ * re-tokenizing every record on each build.
+ */
+export function buildMemberTreeFromColumns(
+  keep: number[],
+  fields: string[],
+  tokenColumns: string[][],
+  valueColumns: DataValue[][],
+  dataset: Dataset,
+): MemberNode[] {
+  const roots = new Map<string, MemberNode>();
+  if (!fields.length) return [];
+
+  for (const i of keep) {
+    let parent = roots;
+    const path: PathSeg[] = [];
+    let key = '';
+    for (let level = 0; level < fields.length; level++) {
+      const uniqueName = fields[level]!;
+      const value = valueColumns[level]![i];
+      const token = tokenColumns[level]![i]!;
+      path.push({ uniqueName, value });
+      key = level === 0 ? token : `${key}\u0001${token}`;
+      let node = parent.get(token);
+      if (!node) {
+        node = {
+          uniqueName,
+          value,
+          caption: dataset.memberCaption(uniqueName, value),
+          level,
+          path: path.map((p) => ({ ...p })),
+          key,
           children: new Map(),
           orderedChildren: [],
           leafCount: 0,

@@ -174,6 +174,23 @@ ds.fieldType('Revenue');     // 'number'
 ds.resolveValue(record, 'Date.year'); // resolve a derived field for one record
 ```
 
+**Pivot cache (reuse the `Dataset`).** The first build resolves + tokenizes each
+field into cached columns and a per-`Dataset` member-token dictionary; subsequent
+builds of the *same* `Dataset` read those instead of re-scanning the records. There
+is nothing to call — just **keep the `Dataset` and rebuild with new configs** to get
+the benefit:
+
+```ts
+const ds = new Dataset({ data: records });
+const a = buildGrid(ds, configA);   // cold: resolves + tokenizes, fills the cache
+const b = buildGrid(ds, configB);   // warm: reuses the cache (faster reconfiguration)
+```
+
+`PivotEngine` already holds one `Dataset` across slice/sort/filter changes, so this
+happens automatically. To **refresh data**, build a *new* `Dataset` (or
+`engine.updateData(...)`): the old cache — including its token dictionary — is
+released with it, so there is no global state to clear.
+
 ## Configuration: `PivotConfiguration`
 
 A `PivotConfiguration` (the "report") is fully serializable:
@@ -442,13 +459,18 @@ blocks. Key exports:
 - data helpers: `parseCsv`, `parseCsvToMatrix`, `inferFieldType`,
   `normalizeValue`, `discoverFields`
 - tree helpers: `buildMemberTree`, `prefixKeys`, `pathKey`, `valueToken`,
-  `flatten`, `flattenCompact`, `flattenClassic`, `flattenFlat` and types
-  `MemberNode`, `PathSeg`, `VisibleNode`
+  `Interner`, `flatten`, `flattenCompact`, `flattenClassic`,
+  `flattenFlat` and types `MemberNode`, `PathSeg`, `VisibleNode`
 - `EventEmitter`
 
 All public types (`PivotConfiguration`, `Slice`, `MeasureConfig`,
 `AggregationType`, `ShowDataAs`, `FieldFilter`, `PivotGrid`, `PivotCell`,
 `HeaderNode`, etc.) are exported from the package root.
+
+Path keys intern distinct member tokens into a compact shared dictionary (an
+`Interner`). Each `Dataset` owns its own interner and reuses it across rebuilds, so
+reconfiguration stays cheap; the dictionary is released with the `Dataset` (a data
+refresh builds a new one), so there is no process-global cache to leak.
 
 ## Related packages
 

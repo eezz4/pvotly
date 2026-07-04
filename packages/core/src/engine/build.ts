@@ -18,14 +18,15 @@ import { resolveCellStyle } from './conditional';
 import { formatValue, resolveFormat } from './format';
 import { buildRecordPredicate, combinePredicates, RecordPredicate } from './filter';
 import {
+  Interner,
   MemberNode,
   PathSeg,
   VisibleNode,
-  buildMemberTree,
+  buildMemberTreeFromColumns,
   computeLeafCount,
   flatten,
   pathKey,
-  prefixKeys,
+  prefixTokenKeys,
 } from './tree';
 
 interface EffectiveMeasure {
@@ -119,6 +120,9 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
 
   const defaultAggregation: AggregationName = options.defaultAggregation ?? 'sum';
   const measures = resolveMeasures(slice.measures ?? [], defaultAggregation, formatsMap, dataset);
+  // This dataset's member-token dictionary. The same interner feeds both the
+  // cached token columns and every pathKey() below, so the keys line up.
+  const interner = dataset.interner;
 
   /* ---- 1. record-level filtering ------------------------------------- */
   const predicates: RecordPredicate[] = [];
@@ -126,7 +130,13 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
     if (f.filter) predicates.push(buildRecordPredicate(dataset, f.uniqueName, f.filter));
   }
   const predicate = combinePredicates(predicates);
-  const records = dataset.records.filter(predicate);
+  // Filter to record indices so the cached pivot-cache columns can be read by
+  // position (the columns are addressed by source-record index).
+  const allRecords = dataset.records;
+  const keep: number[] = [];
+  for (let i = 0; i < allRecords.length; i++) {
+    if (predicate(allRecords[i]!)) keep.push(i);
+  }
 
   /* ---- 2. base aggregation plan -------------------------------------- */
   const baseAggs = new Map<string, { aggregation: AggregationName; field: string | null }>();
@@ -157,17 +167,28 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
   }
 
   /* ---- 3. accumulate cross-tab buckets over every prefix ------------- */
+  // Pivot-cache columns (resolved values + interned token codes), computed once
+  // on the Dataset and reused across builds — reconfiguration no longer re-scans
+  // or re-tokenizes the source records.
+  const rowTokenCols = rowFields.map((f) => dataset.tokenColumn(f));
+  const colTokenCols = colFields.map((f) => dataset.tokenColumn(f));
+  const rowValueCols = rowFields.map((f) => dataset.resolvedColumn(f));
+  const colValueCols = colFields.map((f) => dataset.resolvedColumn(f));
+  const aggValueCols = new Map<string, DataValue[]>();
+  for (const [, { field }] of baseAggs) {
+    if (field && !aggValueCols.has(field)) aggValueCols.set(field, dataset.resolvedColumn(field));
+  }
+
   const cells = new Map<string, Map<string, Map<string, Aggregator>>>();
   const makeBucket = (): Map<string, Aggregator> => {
     const m = new Map<string, Aggregator>();
     for (const [key, { aggregation }] of baseAggs) m.set(key, createAggregator(aggregation, customRegistry));
     return m;
   };
-  for (const record of records) {
-    const rowVals = rowFields.map((f) => dataset.resolveValue(record, f));
-    const colVals = colFields.map((f) => dataset.resolveValue(record, f));
-    const rKeys = prefixKeys(rowVals);
-    const cKeys = prefixKeys(colVals);
+  for (const i of keep) {
+    const record = allRecords[i]!;
+    const rKeys = prefixTokenKeys(rowTokenCols.map((c) => c[i]!));
+    const cKeys = prefixTokenKeys(colTokenCols.map((c) => c[i]!));
     for (const rk of rKeys) {
       let rowMap = cells.get(rk);
       if (!rowMap) {
@@ -181,7 +202,7 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
           rowMap.set(ck, bucket);
         }
         for (const [key, { field }] of baseAggs) {
-          bucket.get(key)!.push(field ? dataset.resolveValue(record, field) : null, record);
+          bucket.get(key)!.push(field ? (aggValueCols.get(field)![i] ?? null) : null, record);
         }
       }
     }
@@ -208,16 +229,16 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
   };
 
   /* ---- 4. build + order member trees --------------------------------- */
-  const rowRoots = buildMemberTree(records, rowFields, dataset);
-  const colRoots = buildMemberTree(records, colFields, dataset);
-  orderAxis(rowRoots, rowSlice, 'row', measures, slice, numericAggAt);
-  orderAxis(colRoots, colSlice, 'column', measures, slice, numericAggAt);
+  const rowRoots = buildMemberTreeFromColumns(keep, rowFields, rowTokenCols, rowValueCols, dataset);
+  const colRoots = buildMemberTreeFromColumns(keep, colFields, colTokenCols, colValueCols, dataset);
+  orderAxis(interner, rowRoots, rowSlice, 'row', measures, slice, numericAggAt);
+  orderAxis(interner, colRoots, colSlice, 'column', measures, slice, numericAggAt);
   rowRoots.forEach(computeLeafCount);
   colRoots.forEach(computeLeafCount);
 
   /* ---- 5. expansion + flatten ---------------------------------------- */
-  const expandedSet = pathSet(slice.expands?.rows, slice.expands?.columns);
-  const collapsedSet = pathSet(slice.drills?.rows, slice.drills?.columns);
+  const expandedSet = pathSet(interner, slice.expands?.rows, slice.expands?.columns);
+  const collapsedSet = pathSet(interner, slice.drills?.rows, slice.drills?.columns);
   const defaultExpanded =
     slice.expands?.expandAll === true ? true : slice.drills?.drillAll === true ? false : true;
   const isExpanded = (node: MemberNode) => {
@@ -322,8 +343,8 @@ export function buildGrid(dataset: Dataset, config: PivotConfiguration): PivotGr
   const columnLeaves = colEntries.map((e) => entryToHeaderNode(e));
 
   const getCell = (rowNode: HeaderNode, colNode: HeaderNode, measure: MeasureConfig): PivotCell => {
-    const rk = pathKey(rowNode.path as PathSeg[]);
-    const ck = pathKey(colNode.path as PathSeg[]);
+    const rk = pathKey(interner, rowNode.path as PathSeg[]);
+    const ck = pathKey(interner, colNode.path as PathSeg[]);
     const found = cellIndex.get(`${rk}|${ck}|${measure.uniqueName}`);
     if (found) return found;
     return {
@@ -400,6 +421,7 @@ function measureAggregation(measures: EffectiveMeasure[], name: string): Aggrega
 
 /** Order + value-filter the children of every node on an axis. */
 function orderAxis(
+  interner: Interner,
   roots: MemberNode[],
   axisFields: SliceField[],
   axis: 'row' | 'column',
@@ -408,7 +430,7 @@ function orderAxis(
   numericAggAt: (r: string, c: string, a: AggregationName, f: string | null) => number | null,
 ): void {
   const valueSort = axis === 'row' ? slice.sorting?.row : slice.sorting?.column;
-  const sortTupleKey = valueSort?.tuple ? pathKey(valueSort.tuple as PathSeg[]) : '';
+  const sortTupleKey = valueSort?.tuple ? pathKey(interner, valueSort.tuple as PathSeg[]) : '';
 
   const orderSiblings = (siblings: MemberNode[], level: number): MemberNode[] => {
     const field = axisFields[level];
@@ -623,10 +645,10 @@ function ratio(value: number | null, total: number | null): number | null {
 
 type MemberPathList = Array<{ tuple: Array<{ uniqueName: string; value: DataValue }> }>;
 
-function pathSet(rows?: MemberPathList, columns?: MemberPathList): Set<string> {
+function pathSet(interner: Interner, rows?: MemberPathList, columns?: MemberPathList): Set<string> {
   const set = new Set<string>();
   const add = (paths?: MemberPathList) => {
-    for (const p of paths ?? []) set.add(pathKey(p.tuple as PathSeg[]));
+    for (const p of paths ?? []) set.add(pathKey(interner, p.tuple as PathSeg[]));
   };
   add(rows);
   add(columns);

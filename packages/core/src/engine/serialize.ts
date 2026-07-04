@@ -9,7 +9,7 @@
  */
 
 import type { HeaderNode, MeasureConfig, PivotCell, PivotGrid } from '../types';
-import { PathSeg, pathKey } from './tree';
+import { Interner, PathSeg, pathKey } from './tree';
 
 /** A {@link PivotGrid} without its non-cloneable `getCell` accessor. */
 export type SerializedGrid = Omit<PivotGrid, 'getCell'>;
@@ -24,18 +24,21 @@ export function serializeGrid(grid: PivotGrid): SerializedGrid {
 
 /** Rebuild a fully-functional {@link PivotGrid} (incl. `getCell`) from cloned data. */
 export function deserializeGrid(grid: SerializedGrid): PivotGrid {
+  // A throwaway interner local to this grid: keys only need to be self-consistent
+  // between the index build below and getCell, not match the original grid's codes.
+  const interner = new Interner();
   const index = new Map<string, PivotCell>();
   for (const row of grid.body) {
     for (const cell of row) {
-      const rk = pathKey(cell.rowPath as PathSeg[]);
-      const ck = pathKey(cell.columnPath as PathSeg[]);
+      const rk = pathKey(interner, cell.rowPath as PathSeg[]);
+      const ck = pathKey(interner, cell.columnPath as PathSeg[]);
       index.set(`${rk}|${ck}|${cell.measure}`, cell);
     }
   }
 
   const getCell = (rowNode: HeaderNode, colNode: HeaderNode, measure: MeasureConfig): PivotCell => {
-    const rk = pathKey(rowNode.path as PathSeg[]);
-    const ck = pathKey(colNode.path as PathSeg[]);
+    const rk = pathKey(interner, rowNode.path as PathSeg[]);
+    const ck = pathKey(interner, colNode.path as PathSeg[]);
     const found = index.get(`${rk}|${ck}|${measure.uniqueName}`);
     if (found) return found;
     return {
